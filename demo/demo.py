@@ -5,17 +5,22 @@
 运行：
     python3 demo/demo.py
 可选环境变量：
-    PROXY_HOST   默认 127.0.0.1
-    PROXY_PORT   默认 8080
-    UPSTREAM_URL 默认 http://127.0.0.1:8000
+    PROXY_HOST        默认 127.0.0.1
+    PROXY_PORT        默认 8080
+    PROXY_CHAOS_PORT  默认 8081（指向混沌端的同一代理）
+    UPSTREAM_URL      默认 http://127.0.0.1:8000
 
 演示内容：
   1. 分片发送的合法 POST /events（逐字节 / 小块 TCP 分片）
   2. 同连接流水线两个合法请求
   3. chunked 请求（代理应重建单一 Content-Length）
-  4. 五种 HTTP 请求走私 / 畸形分帧攻击（全部应被拒绝并断连，且不到达上游）
+  4. 六种 HTTP 请求走私 / 畸形分帧攻击（全部应被拒绝并断连，且不到达上游）
   5. 延迟响应：上游慢 2.5s，代理 2s 超时回 504 并销毁连接，后续请求仍正常
   6. 连接池容量 2：3 个并发慢请求体现两车道
+  7. 路由白名单：GET / 与 POST /admin 必须被拒绝
+  8. 混沌回执（经 8081 代理到混沌端）：接收端收下日志后使坏 ——
+     坏回执 / 完整回执后关闭连接 / 收全后 RST，
+     代理不得重发（实收恒为 1 条），完整回执须原样上交
 最后直接拉取上游“实际收到的请求”清单作为证据。
 """
 
@@ -31,6 +36,7 @@ from dataclasses import dataclass, field
 
 PROXY_HOST = os.environ.get("PROXY_HOST", "127.0.0.1")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8080"))
+PROXY_CHAOS_PORT = int(os.environ.get("PROXY_CHAOS_PORT", "8081"))
 UPSTREAM_URL = os.environ.get("UPSTREAM_URL", "http://127.0.0.1:8000")
 
 PASS = "PASS"
@@ -57,8 +63,8 @@ class Report:
 # --------------------------------------------------------------------------- #
 
 
-def connect() -> socket.socket:
-    s = socket.create_connection((PROXY_HOST, PROXY_PORT), timeout=5)
+def connect(port: int = PROXY_PORT) -> socket.socket:
+    s = socket.create_connection((PROXY_HOST, port), timeout=5)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     return s
 
@@ -395,20 +401,68 @@ def case_routing(report: Report) -> None:
                f"新增其他路径={after_other - before_other}")
 
 
+def case_chaos_receipts(report: Report) -> None:
+    print("\n[8] 混沌回执：接收端收下日志后使坏（代理不得重发，实收恒为 1 条）")
+    chaos_cases = [
+        # (模式, 期望探针状态, 说明)
+        ("bad-receipt", 502, "坏回执（CL 不符后 FIN）→ 502，不重发"),
+        ("close-after-receipt", 202, "完整回执 + Connection: close → 原样上交，不重发"),
+        ("reset-after-receipt", 502, "收全后 RST 无回执 → 502，不重发"),
+    ]
+    for mode, expect_status, desc in chaos_cases:
+        body = json.dumps({"event": f"chaos-{mode}"}).encode()
+        req = (
+            b"POST /events HTTP/1.1\r\nHost: p\r\n"
+            b"X-Chaos-Mode: " + mode.encode() + b"\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
+        before, _ = events_seen(upstream_snapshot())
+        s = connect(PROXY_CHAOS_PORT)
+        try:
+            s.sendall(req)
+            raw = read_response(s)
+        finally:
+            s.close()
+        status = status_of(raw)
+        # 留出发酵窗口：若代理错误重发，第二笔必然已落到混沌端。
+        time.sleep(0.4)
+        after, _ = events_seen(upstream_snapshot())
+        delta = after - before
+        detail = (f"status={status}（期望 {expect_status}），"
+                  f"上游实收新增 {delta} 条（须=1）")
+        ok = status == expect_status and delta == 1
+        if mode == "close-after-receipt" and ok:
+            # 完整回执必须原样上交：校验状态与正文均来自混沌端。
+            body_bytes = raw.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in raw else b""
+            try:
+                payload = json.loads(body_bytes)
+                echoed = (payload.get("accepted") is True
+                          and payload.get("chaos") == mode
+                          and isinstance(payload.get("seq"), int))
+            except json.JSONDecodeError:
+                echoed = False
+            ok = echoed
+            detail += f"，回执正文原样上交={echoed}"
+        report.add(f"混沌 {mode}：{desc}", ok, detail)
+
+
 def show_upstream_evidence() -> None:
-    print("\n[证据] 上游实际收到的请求（最新 8 条）")
-    data = http_get(f"{UPSTREAM_URL}/events?limit=8")
+    print("\n[证据] 上游实际收到的请求（最新 10 条）")
+    data = http_get(f"{UPSTREAM_URL}/events?limit=10")
     for item in data["items"]:
         cl = item["headers"].get("content-length", "-")
         te = item["headers"].get("transfer-encoding", "-")
+        via = item.get("via", "fastapi")
+        chaos = f" chaos={item['chaos_mode']}" if item.get("chaos_mode") else ""
         print(f"  #{item['seq']:<3} {item['method']} {item['path']} "
-              f"tcp={item['client_tcp']} CL={cl} TE={te} "
-              f"body={item['body_bytes']}B  {item['body_text'][:48]!r}")
+              f"tcp={item['client_tcp']} CL={cl} TE={te} via={via}{chaos} "
+              f"body={item['body_bytes']}B  {item['body_text'][:40]!r}")
     print(f"  上游累计收到 {data['count']} 条（走私尝试条数应为 0 条 /events 之外记录）")
 
 
 def main() -> int:
-    print(f"目标代理 {PROXY_HOST}:{PROXY_PORT}，上游 {UPSTREAM_URL}")
+    print(f"目标代理 {PROXY_HOST}:{PROXY_PORT}（混沌 {PROXY_CHAOS_PORT}），"
+          f"上游 {UPSTREAM_URL}")
     try:
         cleared = http_delete(f"{UPSTREAM_URL}/events")
         print(f"已清空上游历史记录：{cleared}")
@@ -418,7 +472,7 @@ def main() -> int:
 
     report = Report()
     for fn in (case_splintered, case_pipeline, case_chunked, case_smuggling,
-               case_timeout, case_pool, case_routing):
+               case_timeout, case_pool, case_routing, case_chaos_receipts):
         try:
             fn(report)
         except OSError as exc:

@@ -7,7 +7,13 @@ HTTP/1.1 反向代理（asyncio + h11，单进程）
     校验通过后丢弃原始分帧，重建单一 Content-Length 再转发；
   * 固定上游，连接池容量 2，每条连接同一时刻只处理一笔；
   * 从发送起总限 2 秒；超时 / 客户端断连即销毁上游连接，迟到响应不会交给下一调用者；
-  * 只有完整收齐带 Content-Length 的响应才把连接归还连接池。
+  * 只有完整收齐带 Content-Length 的响应才把连接归还连接池；
+  * 完整且长度吻合的 Content-Length 回执一律原样上交（状态 + 正文）；
+    连接不可复用（如回执带 Connection: close）只影响回收方式，不影响回执上交；
+  * 防重发铁律：一旦开始向上游写出请求，写 / drain / 回执解析的任何失败都
+    只回 502 并销毁连接，绝不自动重发（上游可能已收下日志，重发 = 重复入库）；
+    仅在确定一字节未写出时（取不到连接 / 状态机拒绝序列化）才换连接重试一次；
+  * 池名额每个检出只释放一次：release/destroy 由 busy 标记保证幂等。
 
 h11 是 sans-IO 解析器：它只负责字节 <-> 事件，所有 IO 与策略由本模块实现。
 """
@@ -71,7 +77,18 @@ class ClientGone(Exception):
 
 
 class UpstreamError(Exception):
-    """上游通信失败（连接、协议、对端关闭等）。"""
+    """上游通信失败（连接、协议、对端关闭等）。
+
+    语义：失败发生在“已尝试写出请求”之后（写 / drain / 回执解析）。
+    上游可能已收下日志，调用方绝不得重发，只能销毁连接并回 502。
+    """
+
+
+class UnsentUpstreamError(UpstreamError):
+    """失败发生在任何字节写出之前（如 h11 状态机拒绝序列化请求）。
+
+    只有这种情况才允许换连接重试：可以确定上游没有收到本请求。
+    """
 
 
 class CloseAfterReply(Exception):
@@ -109,7 +126,12 @@ class UpstreamConn:
 
 
 class UpstreamPool:
-    """容量固定为 2 的上游连接池；每条连接由 busy 保证同一时刻仅处理一笔。"""
+    """容量固定为 2 的上游连接池；每条连接由 busy 保证同一时刻仅处理一笔。
+
+    名额不变式：_active 记录“池拥有的连接数”（空闲 + 检出）。每次检出的
+    连接 busy=True；release/destroy 只在 busy 时生效并立即清 busy，
+    因此同一检出的名额**只释放一次**，重复调用安全（仅告警，不重复计数）。
+    """
 
     def __init__(self, host: str, port: int, capacity: int = POOL_CAPACITY):
         self._host = host
@@ -124,9 +146,10 @@ class UpstreamPool:
         for _ in range(self._capacity + 1):
             uc = await self._take_slot()
             if uc is not None:
+                # 从空闲列表取出即完成检出：先置 busy，后续 destroy 才认账。
+                uc.busy = True
                 # 活性预检：对端若已半关闭，reader 会立刻 EOF。
                 if not uc.closed and not uc.reader.at_eof():
-                    uc.busy = True
                     return uc
                 await self.destroy(uc)  # 死连接销毁并补名额，继续尝试
                 continue
@@ -134,11 +157,14 @@ class UpstreamPool:
             try:
                 reader, writer = await asyncio.open_connection(
                     self._host, self._port)
-            except OSError as exc:
+            except BaseException as exc:
+                # 连接失败或被取消都必须把名额还回来，否则池会缓慢漏光。
                 async with self._cond:
                     self._active -= 1
                     self._cond.notify()
-                raise UpstreamError(f"connect upstream failed: {exc}") from exc
+                if isinstance(exc, OSError):
+                    raise UpstreamError(f"connect upstream failed: {exc}") from exc
+                raise
             return UpstreamConn(reader, writer, h11.Connection(h11.CLIENT),
                                 busy=True)
         raise UpstreamError("pool exhausted while recovering dead connections")
@@ -154,9 +180,14 @@ class UpstreamPool:
                 await self._cond.wait()
 
     async def release(self, uc: UpstreamConn) -> None:
-        """完整成功交换后归还；损坏 / 已关闭的连接直接销毁。"""
+        """完整成功交换后归还；已关闭的连接转为销毁并腾出名额。"""
+        if not uc.busy:
+            log.warning("pool release ignored: conn not checked out "
+                        "(double-return prevented)")
+            return
         uc.busy = False
         if uc.closed:
+            uc.close()  # 幂等
             async with self._cond:
                 self._active -= 1
                 self._cond.notify()
@@ -166,7 +197,12 @@ class UpstreamPool:
             self._cond.notify()
 
     async def destroy(self, uc: UpstreamConn) -> None:
-        """失败路径：销毁连接并腾出池名额。"""
+        """失败路径：销毁连接并腾出池名额；重复调用安全（名额只释放一次）。"""
+        if not uc.busy:
+            log.warning("pool destroy ignored: conn not checked out "
+                        "(double-free prevented)")
+            return
+        uc.busy = False
         uc.close()
         async with self._cond:
             self._active -= 1
@@ -185,14 +221,23 @@ class UpstreamPool:
 
 
 async def exchange_upstream(
-    pool: UpstreamPool,
     uc: UpstreamConn,
     method: bytes,
     target: bytes,
     headers: list[tuple[bytes, bytes]],
     body: bytes,
-) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
+) -> tuple[int, list[tuple[bytes, bytes]], bytes, bool]:
     """在一条已获取的上游连接上完成一次完整的请求/响应交换。
+
+    返回 (status, resp_headers, payload, reusable)。reusable=False 表示
+    回执完整但连接不可复用（如对端声明 Connection: close）——回执照常
+    上交，仅该连接不得归还连接池。
+
+    异常语义（调用方据此决定能否换连接重试）：
+      * UnsentUpstreamError —— 失败发生在任何字节写出之前，
+        上游绝无可能收到本请求，换连接重试是安全的；
+      * UpstreamError —— 已尝试写出之后的一切失败（写 / drain / 回执解析），
+        上游可能已收下日志，调用方绝不得重发，只能销毁连接并回 502。
 
     任何异常都意味着该连接可能处于帧错位状态，调用方必须销毁它，
     从而保证“迟到响应”绝不会被后续调用者读到。
@@ -202,14 +247,24 @@ async def exchange_upstream(
     out_headers.append((b"content-length", str(len(body)).encode("ascii")))
     out_headers.append((b"host", f"{UPSTREAM_HOST}:{UPSTREAM_PORT}".encode("ascii")))
 
+    # 先把整份报文序列化出来：此阶段失败说明一个字节都还没写出，
+    # 属于“确定尚未尝试写出”，可安全换连接重试。
     try:
-        uc.writer.write(uc.conn.send(h11.Request(
-            method=method, target=target, headers=out_headers)))
+        wire = uc.conn.send(h11.Request(
+            method=method, target=target, headers=out_headers))
         if body:
-            uc.writer.write(uc.conn.send(h11.Data(data=body)))
-        uc.writer.write(uc.conn.send(h11.EndOfMessage()))
+            wire += uc.conn.send(h11.Data(data=body))
+        wire += uc.conn.send(h11.EndOfMessage())
+    except h11.LocalProtocolError as exc:
+        raise UnsentUpstreamError(
+            f"cannot serialize request on this connection: {exc}") from exc
+
+    # 自第一次 write 起，请求可能已部分或全部到达上游：
+    # 此后写 / drain / 回执解析的任何失败都不得触发重发。
+    try:
+        uc.writer.write(wire)
         await uc.writer.drain()
-    except (OSError, h11.LocalProtocolError) as exc:
+    except (OSError, RuntimeError) as exc:
         raise UpstreamError(f"send upstream failed: {exc}") from exc
 
     # ---- 读取完整响应 -----------------------------------------------------
@@ -258,12 +313,16 @@ async def exchange_upstream(
     if declared != len(payload):
         raise UpstreamError("upstream Content-Length does not match body")
 
+    # 完整且长度吻合的回执：状态与正文必须原样上交。
+    # 连接是否可复用（如回执带 Connection: close，h11 进入 MUST_CLOSE）
+    # 只影响回收方式，绝不能再把完整回执当作失败去重发。
     uc.requests_served += 1
+    reusable = True
     try:
         uc.conn.start_next_cycle()
-    except h11.LocalProtocolError as exc:
-        raise UpstreamError(f"upstream connection not reusable: {exc}") from exc
-    return status_code, resp_headers, payload
+    except h11.LocalProtocolError:
+        reusable = False
+    return status_code, resp_headers, payload, reusable
 
 
 async def _up_read(uc: UpstreamConn, n: int = READ_BLOCK) -> bytes:
@@ -640,32 +699,44 @@ class InboundProtocol(asyncio.Protocol):
         body: bytes,
         keep_alive: bool,
     ) -> None:
-        # 统一截止时刻：从首次发送起 2 秒，期间无论是否重试都不突破该预算。
+        # 统一截止时刻：从首次获取连接起 2 秒，期间无论是否重试都不突破该预算。
         deadline = time.monotonic() + UPSTREAM_TIMEOUT
         last_exc: Optional[Exception] = None
 
         for attempt in (1, 2):
-            uc = await self._acquire_abortable()
+            # ---- 获取连接 -------------------------------------------------
+            # 连接都没拿到 = 一字节未写出，属于可安全重试的失败。
+            try:
+                uc = await self._acquire_abortable()
+            except UpstreamError as exc:
+                if attempt == 1 and time.monotonic() < deadline:
+                    log.warning("acquire upstream failed %s: %s; retrying once",
+                                self._peer, exc)
+                    last_exc = exc
+                    continue
+                await self._reply_error(502, b"bad gateway\n", keep_alive=False)
+                raise CloseAfterReply("502 sent; upstream acquire failed") from exc
+
             exchange_task = asyncio.create_task(exchange_upstream(
-                self._pool, uc, b"POST", b"/events", headers, body))
+                uc, b"POST", b"/events", headers, body))
             closed_task = asyncio.create_task(self._closed_event.wait())
             timed_out = False
             try:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    timed_out = True
-                else:
-                    try:
-                        async with asyncio.timeout(remaining):
-                            await asyncio.wait(
-                                {exchange_task, closed_task},
-                                return_when=asyncio.FIRST_COMPLETED)
-                    except (asyncio.TimeoutError, TimeoutError):
+                try:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         timed_out = True
-            finally:
-                closed_task.cancel()
+                    else:
+                        try:
+                            async with asyncio.timeout(remaining):
+                                await asyncio.wait(
+                                    {exchange_task, closed_task},
+                                    return_when=asyncio.FIRST_COMPLETED)
+                        except (asyncio.TimeoutError, TimeoutError):
+                            timed_out = True
+                finally:
+                    closed_task.cancel()
 
-            try:
                 # 1) 客户端先断连：取消交换、销毁上游连接后向上抛 ClientGone。
                 if not exchange_task.done() and self._closed_event.is_set():
                     exchange_task.cancel()
@@ -675,29 +746,50 @@ class InboundProtocol(asyncio.Protocol):
 
                 # 2) 交换自身先完成（成功或上游错误），优先采用它的结果。
                 if exchange_task.done() and not timed_out:
-                    try:
-                        status, resp_headers, payload = exchange_task.result()
-                    except UpstreamError as exc:
+                    if exchange_task.cancelled():
+                        # 防御：正常路径不会取消已完成的交换。
                         await self._pool.destroy(uc)
-                        # 首笔失败（死连接/半开/协议错误）：用全新连接在剩余预算内重试一次。
-                        if attempt == 1 and deadline - time.monotonic() > 0:
+                        raise CloseAfterReply("exchange cancelled; close inbound")
+                    exc = exchange_task.exception()
+                    if exc is None:
+                        status, resp_headers, payload, reusable = \
+                            exchange_task.result()
+                        # 连接收尾有且仅有一次：可复用回池，不可复用销毁。
+                        # 完整回执带 Connection: close 也走这里——回执照常上交。
+                        if reusable:
+                            await self._pool.release(uc)
+                        else:
+                            await self._pool.destroy(uc)
+                        # 成功回执与客户端断连交错：连接已按自身状态正确收尾
+                        # （名额只释放一次，健康连接照常回池供其他上报复用），
+                        # 响应无人接收，直接结束。
+                        if self._closed_event.is_set():
+                            raise ClientGone("client closed right after exchange")
+                        self._reply_upstream(status, resp_headers, payload,
+                                             keep_alive)
+                        return
+
+                    # 失败分流：只有“确定一字节未写出”才允许换连接重试一次。
+                    if isinstance(exc, UnsentUpstreamError):
+                        await self._pool.destroy(uc)
+                        if attempt == 1 and time.monotonic() < deadline:
                             log.warning(
-                                "upstream exchange failed %s: %s; retrying once",
-                                self._peer, exc)
+                                "upstream conn failed before write %s: %s; "
+                                "retrying once on a fresh conn", self._peer, exc)
                             last_exc = exc
                             continue
-                        log.warning("upstream ERROR %s: %s; conn destroyed",
-                                    self._peer, exc)
-                        await self._reply_error(
-                            502, b"bad gateway\n", keep_alive=False)
-                        raise CloseAfterReply("502 sent; close inbound") from exc
-                    # 交换恰好完成与客户端断连同拍：响应无法送达，连接仍销毁。
-                    if self._closed_event.is_set():
+                        log.warning("upstream ERROR %s: %s", self._peer, exc)
+                    else:
+                        # 已尝试写出后的任何失败（写 / drain / 回执解析）：
+                        # 上游可能已收下日志，绝不重发，502 + 销毁连接。
                         await self._pool.destroy(uc)
-                        raise ClientGone("client closed right after exchange")
-                    await self._pool.release(uc)
-                    self._reply_upstream(status, resp_headers, payload, keep_alive)
-                    return
+                        log.warning(
+                            "upstream ERROR after write %s: %s; "
+                            "conn destroyed, request NOT resent",
+                            self._peer, exc)
+                    await self._reply_error(502, b"bad gateway\n",
+                                            keep_alive=False)
+                    raise CloseAfterReply("502 sent; close inbound") from exc
 
                 # 3) 超时（含重试后预算耗尽）：取消交换并销毁，迟到响应随连接丢弃。
                 if timed_out:
@@ -715,6 +807,12 @@ class InboundProtocol(asyncio.Protocol):
                 await _silent_await_cancel(exchange_task)
                 await self._pool.destroy(uc)
                 raise CloseAfterReply("unexpected wait state; close inbound")
+            except asyncio.CancelledError:
+                # 自身被取消（进程退出等）：连接必须销毁，池名额不泄漏。
+                exchange_task.cancel()
+                await _silent_await_cancel(exchange_task)
+                await self._pool.destroy(uc)
+                raise
             finally:
                 if not exchange_task.done():
                     exchange_task.cancel()

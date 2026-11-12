@@ -13,10 +13,28 @@ services:
       - upstream
     restart: unless-stopped
 
+  # 同一代理镜像，指向上游容器内的原始 TCP 混沌端（8001）：
+  # 用于演示“接收端收下日志后使坏，代理绝不重发”。
+  proxy-chaos:
+    build: ./proxy
+    environment:
+      UPSTREAM_HOST: upstream
+      UPSTREAM_PORT: "8001"
+      LISTEN_HOST: 0.0.0.0
+      LISTEN_PORT: "8080"
+      LOG_LEVEL: INFO
+    ports:
+      - "8081:8080"
+    depends_on:
+      - upstream
+    restart: unless-stopped
+
   upstream:
     build: ./upstream
     environment:
       UPSTREAM_MAX_STORED: "200"
+      CHAOS_HOST: 0.0.0.0
+      CHAOS_PORT: "8001"
     ports:
       # 暴露到宿主机是为了演示时直接查看“上游实收请求”与 /docs
       - "8000:8000"
